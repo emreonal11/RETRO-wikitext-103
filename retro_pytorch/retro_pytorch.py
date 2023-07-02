@@ -1,4 +1,5 @@
 from functools import partial
+from multiprocessing import reduction
 
 import torch
 import torch.nn.functional as F
@@ -7,11 +8,27 @@ from torch import nn, einsum
 from retro_pytorch.retrieval import BERT_VOCAB_SIZE
 from einops import rearrange, repeat
 
+import math
+
 # constants
 
 MIN_DIM_HEAD = 32
 
 # helper functions
+
+def Linear(in_features, out_features, bias=True):
+    m = nn.Linear(in_features, out_features, bias)
+    nn.init.xavier_uniform_(m.weight)
+    if bias:
+        nn.init.constant_(m.bias, 0.0)
+    return m
+
+def Embedding(num_embeddings, embedding_dim, padding_idx):
+    m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+    nn.init.normal_(m.weight, mean=0, std=embedding_dim ** -0.5)
+    nn.init.constant_(m.weight[padding_idx], 0)
+    return m
+
 
 def exists(val):
     return val is not None
@@ -120,10 +137,10 @@ class FeedForward(nn.Module):
         inner_dim = int(mult * dim)
 
         self.ff = nn.Sequential(
-            nn.Linear(dim, inner_dim),
+            Linear(dim, inner_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(inner_dim, dim)
+            Linear(inner_dim, dim)
         )
 
     def forward(self, x):
@@ -162,6 +179,25 @@ class Attention(nn.Module):
         # and to save attention from breaking if all retrieved chunks are padded out
         self.null_k = nn.Parameter(torch.randn(inner_dim)) if null_kv else None
         self.null_v = nn.Parameter(torch.randn(inner_dim)) if null_kv else None
+
+        self.qkv_same_dim = inner_dim == dim and context_dim == dim
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.qkv_same_dim:
+            # Empirically observed the convergence to be much better with
+            # the scaled initialization
+            nn.init.xavier_uniform_(self.to_q.weight, gain=1 / math.sqrt(2))
+            nn.init.xavier_uniform_(self.to_k.weight, gain=1 / math.sqrt(2))
+            nn.init.xavier_uniform_(self.to_v.weight, gain=1 / math.sqrt(2))
+        else:
+            nn.init.xavier_uniform_(self.to_q.weight)
+            nn.init.xavier_uniform_(self.to_k.weight)
+            nn.init.xavier_uniform_(self.to_v.weight)
+
+        nn.init.xavier_uniform_(self.to_out.weight)
+        if self.to_out.bias is not None:
+            nn.init.constant_(self.to_out.bias, 0.)
 
     def forward(self, x, mask = None, context = None, pos_emb = None):
         b, device, h, scale = x.shape[0], x.device, self.heads, self.scale
@@ -340,7 +376,7 @@ class Encoder(nn.Module):
             ]))
 
         self.norm_out = norm_klass(dim) if final_norm and not post_norm else nn.Identity()
-        self.project_out = nn.Linear(dim, output_dim) if exists(output_dim) else nn.Identity()
+        self.project_out = Linear(dim, output_dim) if exists(output_dim) else nn.Identity()
 
     def forward(self, x, *, mask = None, chunked_seq):
         device, chunk_size, seq_len = x.device, x.shape[-2], chunked_seq.shape[-2]
@@ -475,19 +511,22 @@ class RETRO(nn.Module):
         dec_scale_residual = None,
         norm_klass = None,
         gated_rmsnorm = False,
-        use_deepnet = False
+        use_deepnet = False,
+        share_input_output_embed = False,
     ):
         super().__init__()
         assert dim_head >= MIN_DIM_HEAD, f'dimension per head must be greater than {MIN_DIM_HEAD}'
         self.seq_len = max_seq_len
         self.pad_id = pad_id
 
-        self.token_emb = nn.Embedding(num_tokens, enc_dim)
-        self.pos_emb = nn.Embedding(max_seq_len, enc_dim)
+        self.share_input_output_embed = share_input_output_embed
+
+        self.token_emb = Embedding(num_tokens, enc_dim, padding_idx=pad_id)
+        self.pos_emb = Embedding(max_seq_len, enc_dim, padding_idx=pad_id)
 
         self.chunk_size = chunk_size
 
-        self.to_decoder_model_dim = nn.Linear(enc_dim, dec_dim) if enc_dim != dec_dim else nn.Identity()
+        self.to_decoder_model_dim = Linear(enc_dim, dec_dim) if enc_dim != dec_dim else nn.Identity()
 
         # for deepnet, residual scales
         # follow equation in Figure 2. in https://arxiv.org/abs/2203.00555
@@ -531,13 +570,23 @@ class RETRO(nn.Module):
             scale_residual = dec_scale_residual
         )
 
-        self.to_logits = nn.Linear(dec_dim, num_tokens)
+        if not self.share_input_output_embed:
+            self.out_emb = nn.Parameter(num_tokens, dec_dim)
+        
+        # self.to_logits = nn.Linear(dec_dim, num_tokens)
 
         # deepnet has special init of weight matrices
 
         if use_deepnet:
             deepnorm_init(self.encoder, 0.87 * ((enc_depth ** 4) * dec_depth) ** -0.0625)
             deepnorm_init(self.decoder, (12 * dec_depth) ** -0.25)
+
+    # zzx
+    def to_logits(self, features):
+        if self.share_input_output_embed:
+            return F.linear(features, self.token_emb.weight)
+        else:
+            return F.linear(features, self.out_emb)
 
     def forward_without_retrieval(
         self,
@@ -565,7 +614,8 @@ class RETRO(nn.Module):
         self,
         seq,
         retrieved = None,
-        return_loss = False
+        return_loss = False,
+        labels = None
     ):
         """
         b - batch
@@ -576,9 +626,14 @@ class RETRO(nn.Module):
         """
 
         if not exists(retrieved):
-            return self.forward_without_retrieval(seq)
+            logits = self.forward_without_retrieval(seq)
+            if not return_loss:
+                return logits
+            loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels, ignore_index = self.pad_id, reduction='sum')
+            num_tokens = (labels != self.pad_id).sum()
+            return loss.unsqueeze(0), num_tokens.unsqueeze(0)
 
-        assert not (return_loss and not self.training), 'must be training if returning loss'
+        # assert not (return_loss and not self.training), 'must be training if returning loss'
 
         # assume padding token id (usually 0.) is to be masked out
 
@@ -591,7 +646,7 @@ class RETRO(nn.Module):
 
         # if training, derive labels
 
-        if return_loss:
+        if return_loss and labels is None:
             seq, labels = seq[:, :-1], seq[:, 1:]
 
         # variables
@@ -650,5 +705,6 @@ class RETRO(nn.Module):
 
         # cross entropy loss
 
-        loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels, ignore_index = self.pad_id)
-        return loss
+        loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels, ignore_index = self.pad_id, reduction='sum')
+        num_tokens = (labels != self.pad_id).sum()
+        return loss.unsqueeze(0), num_tokens.unsqueeze(0)
