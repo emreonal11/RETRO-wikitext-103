@@ -1,3 +1,31 @@
+## Experiments on Wikitext-103
+#### 1. Generate chunks from wiki-103 training set
+```bash
+python make_chunks_wiki103.py
+```
+
+#### 2. Generate kNN index using chunks 
+Create BERT index:
+```bash
+python make_index_wiki103.py
+```
+
+Create BM25 index:
+```bash
+python make_bm25index_wiki103.py
+```
+
+#### 3. Training
+```bash
+python run_retro.py --save-dir outputs/base_lm --disable-retro
+
+python run_retro.py --save-dir outputs/bert_retro
+
+python run_retro.py --save-dir outputs/bm25_retro --bm25
+```
+
+**\*\*\*\*\* Below is the original README \*\*\*\*\***
+
 <img src="./RETRO.png" width="500px"></img>
 
 ## RETRO - Pytorch
