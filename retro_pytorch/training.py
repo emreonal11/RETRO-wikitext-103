@@ -16,6 +16,8 @@ from retro_pytorch.utils import memmap, is_true_env_flag
 
 from einops import rearrange
 
+import time
+
 # helpers
 
 def exists(val):
@@ -74,6 +76,9 @@ def top_p(logits, thres = 0.9):
 # 4. gets the knn chunks as well as the continuation from a reference to the chunks data (memmap)
 #
 
+search_time = 0.0
+fetch_time = 0.0
+
 def knn_chunks_from_seq_chunks(
     seq_chunks,
     *,
@@ -82,7 +87,10 @@ def knn_chunks_from_seq_chunks(
     num_chunks,
     chunk_size,
     chunks_memmap_path,
+    offline = False
 ):
+    global search_time
+    global fetch_time
     b, device = seq_chunks.shape[0], seq_chunks.device
 
     # prepare last chunk with sos and eos tokens for BERT embed
@@ -95,14 +103,17 @@ def knn_chunks_from_seq_chunks(
 
     # embed with frozen BERT
 
-    embeds = bert_embed(seq_chunks.cpu()) # fetch embeds on CPU for now
+    embeds = bert_embed(seq_chunks.cpu(), offline = offline) # fetch embeds on CPU for now
 
     # retrieval of knn with faiss
 
+    st = time.time()
     _, knn_indices = faiss_index.search(embeds.cpu().numpy(), k = knn)
+    search_time += time.time() - st
 
     # numpy to torch
 
+    st = time.time()
     with memmap(chunks_memmap_path, dtype = np.int32, shape = (num_chunks + 1, chunk_size + 1)) as chunk_memmap:
         knn_chunks = knn_to_retrieved_chunks(
             knn_indices,
@@ -112,6 +123,10 @@ def knn_chunks_from_seq_chunks(
         )
 
         knn_chunks_torch = torch.from_numpy(knn_chunks).to(device)
+    fetch_time += time.time() - st
+
+    print('search_time', search_time)
+    print('fetch_time', fetch_time)
 
     return knn_chunks_torch
 
@@ -134,6 +149,7 @@ class TrainingWrapper(nn.Module):
         knn_extra_neighbors = 100,
         processed_stats_json_path = './processed-stats.json',
         faiss_index_filename = 'knn.index',
+        offline = False,
         **index_kwargs
     ):
         super().__init__()
@@ -160,7 +176,8 @@ class TrainingWrapper(nn.Module):
                 chunk_size = chunk_size,
                 seq_len = retro.seq_len,
                 max_chunks = max_chunks,
-                max_seqs = max_seqs
+                max_seqs = max_seqs,
+                offline = offline
             )
             with open(processed_stats_json_path, 'w') as f:
                 json.dump(self.stats, f)
@@ -185,8 +202,13 @@ class TrainingWrapper(nn.Module):
             num_extra_neighbors = knn_extra_neighbors,
             index_file = faiss_index_filename,
             force_reprocess = force_reprocess,
+            offline = offline,
             **index_kwargs
         )
+
+        # print('Move faiss index to GPU...')
+        # import faiss
+        # faiss_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 1, faiss_index)
 
         # retro dataset
 
