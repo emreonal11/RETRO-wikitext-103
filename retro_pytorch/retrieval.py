@@ -46,28 +46,36 @@ def faiss_read_index(path):
 MODEL = None
 TOKENIZER = None
 
-def get_tokenizer():
+def get_tokenizer(offline = False):
     global TOKENIZER
     if not exists(TOKENIZER):
-        TOKENIZER = torch.hub.load('huggingface/pytorch-transformers', 'tokenizer', 'bert-base-cased')
+        if offline:
+            TOKENIZER = torch.hub.load(r'/home/eonal/.cache/torch/hub/huggingface_pytorch-transformers_main',
+                                       'tokenizer', 'bert-base-cased', source='local')
+        else:
+            TOKENIZER = torch.hub.load('huggingface/pytorch-transformers', 'tokenizer', 'bert-base-cased')
     return TOKENIZER
 
-def get_bert():
+def get_bert(offline = False):
     global MODEL
     if not exists(MODEL):
-        MODEL = torch.hub.load('huggingface/pytorch-transformers', 'model', 'bert-base-cased')
-        if torch.cuda.is_available():
-            MODEL = MODEL.cuda()
+        if offline:
+            MODEL = torch.hub.load(r'/home/eonal/.cache/torch/hub/huggingface_pytorch-transformers_main',
+                                       'model', 'bert-base-cased', source='local')
+        else:
+            MODEL = torch.hub.load('huggingface/pytorch-transformers', 'model', 'bert-base-cased')
 
+        if torch.cuda.is_available():
+            MODEL = MODEL.cuda()    
     return MODEL
 
 # tokenize
 
-def tokenize(texts, add_special_tokens = True):
+def tokenize(texts, add_special_tokens = True, offline = False):
     if not isinstance(texts, (list, tuple)):
         texts = [texts]
 
-    tokenizer = get_tokenizer()
+    tokenizer = get_tokenizer(offline = offline)
 
     encoding = tokenizer.batch_encode_plus(
         texts,
@@ -86,11 +94,12 @@ def doc_text_to_chunks_and_seq_indices(
     doc_text,
     chunk_size = 64,
     seq_len = 2048,
-    pad_id = 0
+    pad_id = 0,
+    offline = False
 ):
     assert (seq_len % chunk_size) == 0, 'sequence length must be divisible by chunk size'
 
-    ids = tokenize(doc_text)
+    ids = tokenize(doc_text, offline = offline)
     ids = rearrange(ids, '1 ... -> ...')
 
     text_len = ids.shape[-1]
@@ -133,7 +142,8 @@ def text_folder_to_chunks_(
     seq_len = 2048,
     glob = '**/*.txt',
     max_chunks = 1_000_000,
-    max_seqs = 100_000
+    max_seqs = 100_000,
+    offline = False
 ):
     paths = sorted([*Path(folder).glob(glob)])
 
@@ -155,7 +165,8 @@ def text_folder_to_chunks_(
             chunks, seq = doc_text_to_chunks_and_seq_indices(
                 doc_text = path.read_text(),
                 chunk_size = chunk_size,
-                seq_len = seq_len
+                seq_len = seq_len,
+                offline = offline
             )
 
             doc_chunk_len = chunks.shape[0]
@@ -182,9 +193,10 @@ def bert_embed(
     token_ids,
     return_cls_repr = False,
     eps = 1e-8,
-    pad_id = 0.
+    pad_id = 0.,
+    offline = False
 ):
-    model = get_bert()
+    model = get_bert(offline = offline)
     mask = token_ids != pad_id
 
     if torch.cuda.is_available():
@@ -224,7 +236,8 @@ def chunks_to_embeddings_(
     embed_dim = BERT_MODEL_DIM,
     batch_size = 16,
     use_cls_repr = False,
-    pad_id = 0.
+    pad_id = 0.,
+    offline = False
 ):
     chunks_shape = (num_chunks, chunk_size + 1)
     embed_shape = (num_chunks, embed_dim)
@@ -244,7 +257,8 @@ def chunks_to_embeddings_(
 
             batch_embed = bert_embed(
                 batch_chunk,
-                return_cls_repr = use_cls_repr
+                return_cls_repr = use_cls_repr,
+                offline = offline
             )
 
             embeddings[dim_slice] = batch_embed.detach().cpu().numpy()
@@ -277,8 +291,8 @@ def index_embeddings(
     *,
     index_file = 'knn.index',
     index_infos_file = 'index_infos.json',
-    max_index_memory_usage = '100m',
-    current_memory_available = '1G'
+    max_index_memory_usage = '32G',
+    current_memory_available = '40G'
 ):
     embeddings_path = TMP_PATH / embeddings_folder
     index_path = INDEX_FOLDER_PATH / index_file
@@ -310,6 +324,7 @@ def chunks_to_index_and_embed(
     chunks_to_embeddings_batch_size = 16,
     embed_dim = BERT_MODEL_DIM,
     index_file = 'knn.index',
+    offline = False,
     **index_kwargs
 ):
     embedding_path = f'{chunk_memmap_path}.embedded'
@@ -322,7 +337,8 @@ def chunks_to_index_and_embed(
         embeddings_memmap_path = embedding_path,
         use_cls_repr = use_cls_repr,
         batch_size = chunks_to_embeddings_batch_size,
-        embed_dim = embed_dim
+        embed_dim = embed_dim,
+        offline = offline
     )
 
     memmap_file_to_chunks_(
@@ -356,6 +372,7 @@ def chunks_to_precalculated_knn_(
     num_extra_neighbors = 10,
     force_reprocess = False,
     index_file = 'knn.index',
+    offline = False,
     **index_kwargs
 ):
     chunk_path = Path(chunk_memmap_path)
@@ -377,6 +394,7 @@ def chunks_to_precalculated_knn_(
         chunk_size = chunk_size,
         chunk_memmap_path = chunk_memmap_path,
         index_file = index_file,
+        offline = offline,
         **index_kwargs
     )
 
